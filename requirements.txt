@@ -1,2 +1,2 @@
-akshare>=1.14.0
-pandas>=2.0.0
+# update_prices.py 仅用 Python 标准库（urllib + re + json），无外部依赖。
+# 此文件保留为占位，方便未来添加可选依赖（如增加 pandas 做数据校验）。

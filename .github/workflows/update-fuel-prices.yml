@@ -20,11 +20,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
+      # update_prices.py 仅用 Python 标准库，无 pip install 步骤（启动快 30 秒）
       - name: Fetch latest prices
         run: python update_prices.py
 

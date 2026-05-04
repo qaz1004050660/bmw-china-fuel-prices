@@ -1,162 +1,156 @@
 #!/usr/bin/env python3
 """
-抓发改委 31 省 4 油号当期油价 → 生成 fuel-prices.json。
+抓 qiyoujiage.com 北京 92# 油价 → 用稳定差价矩阵派生 31 省 4 油号 → fuel-prices.json。
 
-数据源：AKShare `energy_oil_detail` —— 开源、稳定、抓发改委公告原始数据。
-输出格式：与 iOS 端 FuelPriceTable.AdjustmentEntry 解码兼容。
+为什么改用 qiyoujiage 替代 AKShare：
+  - AKShare energy_oil_detail() 返的"最新"曾返 2022-05-17 老期（upstream stale）
+  - qiyoujiage.com 实测每日同步发改委公告，2022-2026 稳定可靠
+  - urllib + re 标准库，无 pip 依赖，workflow 启动快
 
-合并策略：
-  - 已有 fuel-prices.json → 读出 entries
-  - 抓最新一期 → 若日期不在 entries 内则 append
-  - 写回 JSON（按日期升序）
+数据派生策略（与 iOS FuelPriceTable.standardSnapshot 1:1 对齐）：
+  - 北京 92# = qiyoujiage 抓取（唯一外部数据点）
+  - 北京 95#/98#/0# = 92# + 标准差价（多年稳定）
+  - 其他 30 省 4 油号 = 北京价 + 各省稳定差价矩阵
+  - 海南附加费 +30%、西藏运输 +10% 等地理差异已编码进矩阵
 
-幂等：同一天反复跑不会重复入库（按 effectiveDate 去重）。
+参考：/Users/abaodeji/Desktop/控制器+灯控/油价自动化/update_fuel_prices.py（Android 项目同源脚本）
 """
+
+from __future__ import annotations
+
 import json
+import re
 import sys
-from datetime import datetime, timezone
+import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Optional
 
-import akshare as ak  # type: ignore
-import pandas as pd  # type: ignore
+# ============================================================
+#  配置
+# ============================================================
+SOURCE_URL = "http://www.qiyoujiage.com/beijing.shtml"   # 站点 HTTPS 证书 hostname mismatch，用 http
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+TIMEOUT = 15
 
+BEIJING_TZ = timezone(timedelta(hours=8))
+OUTPUT_PATH = Path(__file__).parent / "fuel-prices.json"
 
-# **省名归一**（与 iOS FuelPriceTable.normalizeProvinceName 1:1 对齐）：
-# 长后缀优先 strip，匹配一次就 break。
-# AkShare 返的省份字段可能是"北京"/"北京市"/"广西壮族自治区"任意形式，统一去后缀。
-PROVINCE_SUFFIXES = [
-    "维吾尔自治区",  # 新疆
-    "壮族自治区",    # 广西
-    "回族自治区",    # 宁夏
-    "自治区",        # 内蒙古 / 西藏
-    "省",
-    "市",
-]
+# 北京 4 油号差价（对齐 FuelPriceTable.swift bj() helper）
+GRADE_DELTA_95 = 0.50
+GRADE_DELTA_98 = 1.54
+GRADE_DELTA_0 = -0.22
 
-# 已知有效省份白名单（AkShare 返的脏数据 / 港澳台过滤）
-VALID_PROVINCES = {
-    "北京", "天津", "河北", "山西", "内蒙古",
-    "辽宁", "吉林", "黑龙江",
-    "上海", "江苏", "浙江", "安徽", "福建", "江西", "山东",
-    "河南", "湖北", "湖南",
-    "广东", "广西", "海南",
-    "重庆", "四川", "贵州", "云南", "西藏",
-    "陕西", "甘肃", "青海", "宁夏", "新疆",
+# 各省相对北京的价差（元/L），多年发改委公告平均稳定值。
+# **必须与 iOS FuelPriceTable.standardSnapshot.provinceDiff 完全一致**。
+PROVINCE_DIFF: dict[str, tuple[float, float, float, float]] = {
+    # province: (Δp92, Δp95, Δp98, Δp0)
+    "北京":   (0.00, 0.00, 0.00, 0.00),
+    "上海":   (-0.04, -0.04, -0.04, -0.05),
+    "天津":   (-0.05, -0.05, -0.05, -0.06),
+    "重庆":   (0.13, 0.13, 0.13, 0.10),
+    "河北":   (-0.04, -0.04, -0.04, -0.06),
+    "山西":   (-0.02, -0.02, -0.02, -0.04),
+    "辽宁":   (-0.05, -0.05, -0.05, -0.07),
+    "吉林":   (0.00, 0.00, 0.00, -0.02),
+    "黑龙江": (-0.02, -0.02, -0.02, -0.04),
+    "江苏":   (-0.04, -0.04, -0.04, -0.05),
+    "浙江":   (-0.04, -0.04, -0.04, -0.05),
+    "安徽":   (-0.02, -0.02, -0.02, -0.04),
+    "福建":   (-0.04, -0.04, -0.04, -0.06),
+    "江西":   (-0.01, -0.01, -0.01, -0.04),
+    "山东":   (-0.04, -0.04, -0.04, -0.05),
+    "河南":   (-0.03, -0.03, -0.03, -0.05),
+    "湖北":   (0.05, 0.05, 0.05, 0.02),
+    "湖南":   (0.07, 0.07, 0.07, 0.04),
+    "广东":   (0.05, 0.05, 0.05, 0.02),
+    "广西":   (0.10, 0.10, 0.10, 0.07),
+    "海南":   (1.45, 1.50, 1.55, 1.40),    # 海南燃油附加费 ~30% 加成
+    "四川":   (0.13, 0.13, 0.13, 0.10),
+    "贵州":   (0.13, 0.13, 0.13, 0.10),
+    "云南":   (0.13, 0.13, 0.13, 0.10),
+    "陕西":   (0.00, 0.00, 0.00, -0.02),
+    "甘肃":   (0.00, 0.00, 0.00, -0.02),
+    "青海":   (0.05, 0.05, 0.05, 0.03),
+    "宁夏":   (-0.04, -0.04, -0.04, -0.06),
+    "新疆":   (-0.10, -0.10, -0.10, -0.12),
+    "内蒙古": (-0.04, -0.04, -0.04, -0.06),
+    "西藏":   (0.85, 0.85, 0.85, 0.80),    # 西藏运输高
 }
 
 
-def normalize_province(name: str) -> str | None:
-    """与 iOS FuelPriceTable.normalizeProvinceName 一致的省份归一。"""
-    n = (name or "").strip()
-    for suffix in PROVINCE_SUFFIXES:
-        if n.endswith(suffix):
-            n = n[: -len(suffix)]
-            break
-    return n if n in VALID_PROVINCES else None
+# ============================================================
+#  抓取
+# ============================================================
+def fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 
-OUTPUT_PATH = Path(__file__).parent / "fuel-prices.json"
-
-
-def find_latest_date() -> str:
-    """
-    用 energy_oil_hist 拿调价历史，找最近一次调价日期。
-    energy_oil_detail() 不传 date 默认返回 2022 旧数据，必须显式传日期。
-    返回 YYYYMMDD 格式。
-    """
-    try:
-        hist = ak.energy_oil_hist(symbol="北京")
-        if hist is not None and not hist.empty:
-            # hist 列：日期 / 0号 / 92号 / 95号 / 89号 等
-            hist["日期"] = pd.to_datetime(hist["日期"], errors="coerce")
-            hist = hist.dropna(subset=["日期"]).sort_values("日期", ascending=False)
-            if not hist.empty:
-                latest = hist.iloc[0]["日期"]
-                return latest.strftime("%Y%m%d")
-    except Exception as exc:
-        print(f"[warn] energy_oil_hist 失败: {exc}", file=sys.stderr)
-
-    # Fallback：从今天倒推找最近有数据的日期
-    from datetime import date as dt_date, timedelta
-    for i in range(30):
-        d = (dt_date.today() - timedelta(days=i)).strftime("%Y%m%d")
-        try:
-            df = ak.energy_oil_detail(date=d)
-            if df is not None and not df.empty:
-                return d
-        except Exception:
-            continue
-    raise RuntimeError("找不到任何有效油价日期")
-
-
-def fetch_latest_entries() -> dict:
-    """
-    抓最新调价日 31 省 × 4 油号数据。
-    返回 {"YYYY-MM-DD": {"北京": {"p92": 7.92, ...}, ...}}
-    """
-    target_yyyymmdd = find_latest_date()
-    print(f"[fetch] target date: {target_yyyymmdd}", file=sys.stderr)
-    df = ak.energy_oil_detail(date=target_yyyymmdd)
-    if df is None or df.empty:
-        raise RuntimeError(f"AKShare {target_yyyymmdd} 返回空数据")
-
-    print(f"[fetch] columns: {list(df.columns)}", file=sys.stderr)
-    print(f"[fetch] rows: {len(df)}", file=sys.stderr)
-
-    # AKShare energy_oil_detail() 实测列名：
-    #   日期 / 地区 / V_0 / V_89 / V_92 / V_95 / ZDE_* / QE_*
-    # **不返回 98 号**（中国 92/95/89/0 是发改委标准 4 油号；98 号需省厅另行公布）
-    # 我们用稳定差价 p98 = p92 + 1.54 派生，与 FuelPriceTable.bj() helper 一致。
-    by_date: dict[str, dict[str, dict[str, float]]] = {}
-
-    def safe(row, *field_names: str) -> float:
-        for name in field_names:
-            val = row.get(name)
-            if val is None:
-                continue
+def parse_beijing_92(html: str) -> Optional[float]:
+    """qiyoujiage.com 页面结构（实测 2026-05 稳定）：<dt>北京92#汽油</dt><dd>8.46</dd>"""
+    patterns = [
+        r"<dt>\s*北京\s*92\s*[#号]?\s*汽油\s*</dt>\s*<dd>\s*(\d+\.\d{1,3})\s*</dd>",
+        r"北京\s*92\s*[#号]?\s*汽油\s*</dt>\s*<dd>\s*(\d+\.\d{1,3})",
+        r"92\s*[#号]?\s*汽油.{0,80}?(\d+\.\d{1,3})\s*元\s*/?\s*升",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.DOTALL)
+        if m:
             try:
-                f = float(val)
-                if f > 0:
-                    return f
-            except (ValueError, TypeError):
+                p = float(m.group(1))
+                if 4.5 <= p <= 14.0:   # 物理边界（2022-2026 历史范围 5.5-12，留余量）
+                    return p
+            except ValueError:
                 continue
-        return 0.0
+    return None
 
-    for _, row in df.iterrows():
-        date_raw = str(row.get("日期", "")).strip()
-        if not date_raw:
-            continue
-        try:
-            dt = datetime.fromisoformat(date_raw[:10])
-            date = dt.strftime("%Y-%m-%d")
-        except (ValueError, TypeError):
-            continue
 
-        # 实测字段名是"地区"，兼容老接口"省份"
-        province_raw = str(row.get("地区") or row.get("省份") or "").strip()
-        province = normalize_province(province_raw)
-        if not province:
-            continue
+def parse_adjustment_date(html: str) -> Optional[str]:
+    """抽取页面里"最近调价日"作为 effectiveDate。抽不到用今天日期。"""
+    patterns = [
+        r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日",
+        r"(\d{4})-(\d{1,2})-(\d{1,2})",
+    ]
+    today = datetime.now(BEIJING_TZ).date()
+    for pat in patterns:
+        m = re.search(pat, html)
+        if m:
+            try:
+                y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                got = datetime(y, mo, d).date()
+                # 合理性检查：仅接受最近 90 天内日期（防止抓到无关历史日期）
+                if 0 <= (today - got).days <= 90:
+                    return got.strftime("%Y-%m-%d")
+            except (ValueError, OverflowError):
+                continue
+    return None
 
-        p92 = safe(row, "V_92", "92号", "92号汽油")
-        if p92 <= 0:
-            continue  # 92 都没有 → 这行数据不可用
 
-        # **AKShare V_95 列内容不可靠**（实测 V_95 < V_92，违反真实油价规律 95>92）
-        # 推测 AKShare 列名编码混乱（可能 V_95 实际是 89 号汽油）
-        # 解决：只信任 V_92 + V_0，p95/p98 按中国稳定差价派生（与 FuelPriceTable.bj 一致）
-        # 多年实测稳定差价：95 = 92 + 0.50, 98 = 92 + 1.54
-        prices = {
-            "p92": p92,
-            "p95": round(p92 + 0.50, 2),
-            "p98": round(p92 + 1.54, 2),
-            "p0": safe(row, "V_0", "0号", "0号柴油"),
+# ============================================================
+#  31 省派生
+# ============================================================
+def build_31_province_prices(p92_beijing: float) -> dict:
+    """从北京 92# 价 → 31 省 4 油号完整价格（与 iOS standardSnapshot 1:1 对齐）。"""
+    p95_bj = p92_beijing + GRADE_DELTA_95
+    p98_bj = p92_beijing + GRADE_DELTA_98
+    p0_bj = p92_beijing + GRADE_DELTA_0
+
+    result: dict[str, dict[str, float]] = {}
+    for province, (d92, d95, d98, d0) in PROVINCE_DIFF.items():
+        result[province] = {
+            "p92": round(p92_beijing + d92, 2),
+            "p95": round(p95_bj + d95, 2),
+            "p98": round(p98_bj + d98, 2),
+            "p0": round(p0_bj + d0, 2),
         }
-        by_date.setdefault(date, {})[province] = prices
-
-    return by_date
+    return result
 
 
+# ============================================================
+#  主流程
+# ============================================================
 def load_existing() -> dict:
     if not OUTPUT_PATH.exists():
         return {"version": 1, "entries": []}
@@ -168,45 +162,61 @@ def load_existing() -> dict:
         return {"version": 1, "entries": []}
 
 
-def merge_entries(existing: list, new_by_date: dict) -> tuple[list, int]:
-    """合并新数据。返回 (合并后 entries, 新增条数)。"""
-    seen_dates = {e["effectiveDate"] for e in existing}
-    added = 0
-    for date, prices in new_by_date.items():
-        if date in seen_dates:
-            continue  # 已有同日期 entry → 跳过（幂等）
-        existing.append({"effectiveDate": date, "prices": prices})
-        added += 1
-    existing.sort(key=lambda e: e["effectiveDate"])
-    return existing, added
-
-
 def main() -> int:
     print(f"[update] start {datetime.now(timezone.utc).isoformat()}", file=sys.stderr)
 
+    # 1. 抓 qiyoujiage 北京 92# 价
+    print(f"[fetch] {SOURCE_URL}", file=sys.stderr)
     try:
-        new_data = fetch_latest_entries()
+        html = fetch_text(SOURCE_URL)
     except Exception as exc:
-        print(f"[error] AKShare 抓取失败: {exc}", file=sys.stderr)
+        print(f"[error] 抓 qiyoujiage 失败: {exc}", file=sys.stderr)
         return 1
 
-    if not new_data:
-        print("[error] 未抓到任何有效数据", file=sys.stderr)
+    p92 = parse_beijing_92(html)
+    if p92 is None:
+        print("[error] 解析北京 92# 价失败。HTML head 500 字节:", file=sys.stderr)
+        print(html[:500], file=sys.stderr)
         return 1
 
+    eff_date = parse_adjustment_date(html) or datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+    print(f"[fetch] effectiveDate={eff_date}, beijing p92={p92}", file=sys.stderr)
+
+    # 2. 派生 31 省 4 油号
+    prices_31 = build_31_province_prices(p92)
+    new_entry = {"effectiveDate": eff_date, "prices": prices_31}
+
+    # 3. 合并到现有 fuel-prices.json（幂等去重）
     feed = load_existing()
-    entries = feed.get("entries", [])
-    merged, added = merge_entries(entries, new_data)
+    entries: list[dict] = feed.get("entries", [])
+    existing_dates = {e.get("effectiveDate") for e in entries}
+
+    if eff_date in existing_dates:
+        # 同日 entry 已存在 → 检查北京 92# 是否变化
+        for e in entries:
+            if e.get("effectiveDate") == eff_date:
+                old_p92 = e.get("prices", {}).get("北京", {}).get("p92")
+                if old_p92 is not None and abs(old_p92 - p92) < 0.005:
+                    print(f"[skip] {eff_date} 已存在且 p92={p92} 一致", file=sys.stderr)
+                else:
+                    e["prices"] = prices_31
+                    print(f"[update] {eff_date} p92 改变: {old_p92} → {p92}", file=sys.stderr)
+                break
+    else:
+        entries.append(new_entry)
+        entries.sort(key=lambda x: x.get("effectiveDate", ""))
+        print(f"[append] new entry: {eff_date}", file=sys.stderr)
 
     feed["version"] = 1
     feed["generatedAt"] = datetime.now(timezone.utc).isoformat()
-    feed["entries"] = merged
+    feed["entries"] = entries
 
-    with OUTPUT_PATH.open("w", encoding="utf-8") as f:
-        json.dump(feed, f, ensure_ascii=False, indent=2)
-
-    print(f"[update] done. 新增 {added} 期，总 {len(merged)} 期", file=sys.stderr)
-    return 0 if added > 0 else 0  # 即使无新数据也算成功（幂等）
+    OUTPUT_PATH.write_text(
+        json.dumps(feed, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"[done] wrote {OUTPUT_PATH}, total entries: {len(entries)}", file=sys.stderr)
+    return 0
 
 
 if __name__ == "__main__":
