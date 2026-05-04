@@ -1,0 +1,41 @@
+name: Update Fuel Prices
+
+on:
+  schedule:
+    # 每周二、四、六 01:00 UTC = 北京 09:00
+    # 中国发改委油价每 10 个工作日调一次（约 24 期/年），跑 3 次/周确保不漏
+    - cron: "0 1 * * 2,4,6"
+  workflow_dispatch: {}     # 允许手动触发（首次部署后立即跑一次拿种子数据）
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # 给 GITHUB_TOKEN 推送权限
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch latest prices
+        run: python update_prices.py
+
+      - name: Commit & push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fuel-prices.json
+          if git diff --cached --quiet; then
+            echo "No price changes, skip commit."
+          else
+            git commit -m "Update fuel prices ($(date -u +'%F %H:%MZ'))"
+            git push
+          fi
