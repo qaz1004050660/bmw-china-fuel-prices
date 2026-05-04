@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import akshare as ak  # type: ignore
+import pandas as pd  # type: ignore
 
 
 # **省名归一**（与 iOS FuelPriceTable.normalizeProvinceName 1:1 对齐）：
@@ -57,15 +58,47 @@ def normalize_province(name: str) -> str | None:
 OUTPUT_PATH = Path(__file__).parent / "fuel-prices.json"
 
 
+def find_latest_date() -> str:
+    """
+    用 energy_oil_hist 拿调价历史，找最近一次调价日期。
+    energy_oil_detail() 不传 date 默认返回 2022 旧数据，必须显式传日期。
+    返回 YYYYMMDD 格式。
+    """
+    try:
+        hist = ak.energy_oil_hist(symbol="北京")
+        if hist is not None and not hist.empty:
+            # hist 列：日期 / 0号 / 92号 / 95号 / 89号 等
+            hist["日期"] = pd.to_datetime(hist["日期"], errors="coerce")
+            hist = hist.dropna(subset=["日期"]).sort_values("日期", ascending=False)
+            if not hist.empty:
+                latest = hist.iloc[0]["日期"]
+                return latest.strftime("%Y%m%d")
+    except Exception as exc:
+        print(f"[warn] energy_oil_hist 失败: {exc}", file=sys.stderr)
+
+    # Fallback：从今天倒推找最近有数据的日期
+    from datetime import date as dt_date, timedelta
+    for i in range(30):
+        d = (dt_date.today() - timedelta(days=i)).strftime("%Y%m%d")
+        try:
+            df = ak.energy_oil_detail(date=d)
+            if df is not None and not df.empty:
+                return d
+        except Exception:
+            continue
+    raise RuntimeError("找不到任何有效油价日期")
+
+
 def fetch_latest_entries() -> dict:
     """
-    AKShare energy_oil_detail() 返回 31 省 × 4 油号的最新一期。
-
-    返回 {"YYYY-MM-DD": {"BJ": {"p92": 7.92, ...}, ...}}
+    抓最新调价日 31 省 × 4 油号数据。
+    返回 {"YYYY-MM-DD": {"北京": {"p92": 7.92, ...}, ...}}
     """
-    df = ak.energy_oil_detail()
+    target_yyyymmdd = find_latest_date()
+    print(f"[fetch] target date: {target_yyyymmdd}", file=sys.stderr)
+    df = ak.energy_oil_detail(date=target_yyyymmdd)
     if df is None or df.empty:
-        raise RuntimeError("AKShare 返回空数据")
+        raise RuntimeError(f"AKShare {target_yyyymmdd} 返回空数据")
 
     print(f"[fetch] columns: {list(df.columns)}", file=sys.stderr)
     print(f"[fetch] rows: {len(df)}", file=sys.stderr)
