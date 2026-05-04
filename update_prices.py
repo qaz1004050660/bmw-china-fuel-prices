@@ -70,43 +70,52 @@ def fetch_latest_entries() -> dict:
     print(f"[fetch] columns: {list(df.columns)}", file=sys.stderr)
     print(f"[fetch] rows: {len(df)}", file=sys.stderr)
 
-    # AKShare 列名（实测）：日期, 省份, 89号, 92号, 95号, 0号
-    # 不同时期接口可能有 89/92/95/98/0 不同组合，做兼容处理
+    # AKShare energy_oil_detail() 实测列名：
+    #   日期 / 地区 / V_0 / V_89 / V_92 / V_95 / ZDE_* / QE_*
+    # **不返回 98 号**（中国 92/95/89/0 是发改委标准 4 油号；98 号需省厅另行公布）
+    # 我们用稳定差价 p98 = p92 + 1.54 派生，与 FuelPriceTable.bj() helper 一致。
     by_date: dict[str, dict[str, dict[str, float]]] = {}
+
+    def safe(row, *field_names: str) -> float:
+        for name in field_names:
+            val = row.get(name)
+            if val is None:
+                continue
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except (ValueError, TypeError):
+                continue
+        return 0.0
 
     for _, row in df.iterrows():
         date_raw = str(row.get("日期", "")).strip()
         if not date_raw:
             continue
-        # AKShare 日期可能是 "2026-05-06" 或 datetime
         try:
             dt = datetime.fromisoformat(date_raw[:10])
             date = dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError):
             continue
 
-        province_raw = str(row.get("省份", "")).strip()
+        # 实测字段名是"地区"，兼容老接口"省份"
+        province_raw = str(row.get("地区") or row.get("省份") or "").strip()
         province = normalize_province(province_raw)
         if not province:
             continue
 
-        def safe(field_name: str, fallback: float = 0.0) -> float:
-            val = row.get(field_name)
-            try:
-                return float(val) if val is not None else fallback
-            except (ValueError, TypeError):
-                return fallback
+        p92 = safe(row, "V_92", "92号", "92号汽油")
+        if p92 <= 0:
+            continue  # 92 都没有 → 这行数据不可用
 
-        # 字段优先级：92 必有，95/98/0 缺失填 0（iOS 端按 0 当 unavailable 处理）
         prices = {
-            "p92": safe("92号", safe("92号汽油")),
-            "p95": safe("95号", safe("95号汽油")),
-            "p98": safe("98号", safe("98号汽油")),
-            "p0": safe("0号", safe("0号柴油")),
+            "p92": p92,
+            "p95": safe(row, "V_95", "95号", "95号汽油"),
+            # 98 号 AKShare 不返，按稳定差价派生：95 = 92 + 0.50, 98 = 92 + 1.54
+            "p98": p92 + 1.54,
+            "p0": safe(row, "V_0", "0号", "0号柴油"),
         }
-        if prices["p92"] <= 0:
-            continue  # 92 都没有 → 这条数据不可用
-
         by_date.setdefault(date, {})[province] = prices
 
     return by_date
