@@ -142,11 +142,14 @@ def fetch_latest_entries() -> dict:
         if p92 <= 0:
             continue  # 92 都没有 → 这行数据不可用
 
+        # **AKShare V_95 列内容不可靠**（实测 V_95 < V_92，违反真实油价规律 95>92）
+        # 推测 AKShare 列名编码混乱（可能 V_95 实际是 89 号汽油）
+        # 解决：只信任 V_92 + V_0，p95/p98 按中国稳定差价派生（与 FuelPriceTable.bj 一致）
+        # 多年实测稳定差价：95 = 92 + 0.50, 98 = 92 + 1.54
         prices = {
             "p92": p92,
-            "p95": safe(row, "V_95", "95号", "95号汽油"),
-            # 98 号 AKShare 不返，按稳定差价派生：95 = 92 + 0.50, 98 = 92 + 1.54
-            "p98": p92 + 1.54,
+            "p95": round(p92 + 0.50, 2),
+            "p98": round(p92 + 1.54, 2),
             "p0": safe(row, "V_0", "0号", "0号柴油"),
         }
         by_date.setdefault(date, {})[province] = prices
